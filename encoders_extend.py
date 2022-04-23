@@ -482,6 +482,7 @@ class SoftPoolingGcnEncoder(GcnEncoderGraph):
         '''
         embedding_tensor = self.gcn_forward(x, adj,
                 self.conv_first, self.conv_block, self.conv_last, embedding_mask)
+        embedding = embedding_tensor.clone()
         out, _ = torch.max(embedding_tensor, dim=1)
         out_all.append(out)
         # self.num_aggs = 1
@@ -542,11 +543,10 @@ class SoftPoolingGcnEncoder(GcnEncoderGraph):
             embedding_tensor = self.gcn_forward(x, adj,
                     self.conv_first_after_pool[i], self.conv_block_after_pool[i],
                     self.conv_last_after_pool[i])
-            time0 = time.time()
+            positive = embedding_tensor.clone()
             extend_embedding_tensor = self.vgae_forward(x, adj, self.assign_tensor, batch_num_nodes, adj_origin,
                                                 self.vgae_first_after_pool[i], self.vgae_block_after_pool[i],
                                                 self.vgae_last_after_pool[i])
-            time1 = time.time()
             #print(time1-time0)
             # embedding_tensor:[20, 100, 90]
             out, _ = torch.max(embedding_tensor, dim=1)
@@ -564,7 +564,7 @@ class SoftPoolingGcnEncoder(GcnEncoderGraph):
             output = out
         # pred_model:[180, 50, 6]; ypred:[20, 6]
         ypred = self.pred_model(output)
-        return ypred, extend_embedding_tensor
+        return ypred, extend_embedding_tensor, embedding
 
     def loss(self, pred, label, adj=None, batch_num_nodes=None, adj_hop=1):
         ''' 
@@ -638,36 +638,50 @@ class SoftPoolingGcnEncoder(GcnEncoderGraph):
         A_pred = Z @ torch.transpose(Z, 1, 2)
         return A_pred
 
-class VGAE(nn.Module):
-    def __init__(self, adj):
-        #adj->归一化的邻接矩阵
-        super(VGAE,self).__init__()
-        #定义卷积层1(1443 x 32)
-        self.base_gcn = GraphConv(args.input_dim, args.hidden1_dim, adj)
-        # 定义卷积层2(32 x 16) 均值
-        self.gcn_mean = GraphConv(args.hidden1_dim, args.hidden2_dim, adj, activation=lambda x:x)
-        #定义卷积层3(32 x 16) log(方差)
-        self.gcn_logstddev = GraphConv(args.hidden1_dim, args.hidden2_dim, adj, activation=lambda x:x)
+    def MI_Est(self, discriminator, embeddings, positive):
+        '''
 
-    def encode(self, X):
-        #X传入特征矩阵(n,1443)
-        #hidden -> (n x 32)
-        hidden = self.base_gcn(X)
-        #均值
-        self.mean = self.gcn_mean(hidden)
-        #方差
-        self.logstd = self.gcn_logstddev(hidden)
-        #从标准正态分布抽取随机值，为一个[n x hidden2_dim]矩阵赋值
-        #gaussian_noise = torch.randn(X.size(0), args.hidden2_dim)
-        laplace = torch.distributions.laplace.Laplace(torch.tensor(0.0), torch.tensor(1.0))
-        laplace_noise = laplace.sample([X.size(0),args.hidden2_dim])
-        #[n x 16] * e^logstd(n x 16) + mean(n x 16)  	*点乘
-        sampled_z = laplace_noise*torch.exp(self.logstd) + self.mean
-        return sampled_z
-    #X->传入特征矩阵
-    def forward(self, X):
-        #encode(features)
-        Z = self.encode(X)
-        self.Z = Z
-        A_pred = dot_product_decode(Z)
-        return A_pred
+        :param discriminator: 辨别器：[3*out_put,1]
+        :param embeddings: 图级别嵌入：[20, 1000, 90]
+        :param positive: 子图复原嵌入：[20, 1000, 30]
+        :return:
+        '''
+        # torch.randperm(self.batch_size) -> 将(0, self.batch_size)随机打乱获得一个数字序列
+        shuffle_embeddings = embeddings[torch.randperm(embeddings.shape[0])]
+        # joint:[128, 1]
+        joint = discriminator(embeddings,positive)
+        # margin:[128, 1]
+        margin = discriminator(shuffle_embeddings,positive)
+        mi_est = torch.sigmoid(torch.mean(joint) - torch.log(torch.mean(torch.exp(margin))))
+
+        return mi_est
+
+class Discriminator(torch.nn.Module):
+    def __init__(self, args):
+        super(Discriminator, self).__init__()
+
+        self.args = args
+        # input_size: output_dim * 4
+        self.input_size = self.args.output_dim * 4
+        # hidden_size: output_dim
+        self.hidden_size = self.args.output_dim
+        # fc1:[input_size, hidden_size]
+        self.fc1 = nn.Linear(self.input_size,self.hidden_size).cuda()
+        # fc2:[hidden_size, 1]
+        self.fc2 = nn.Linear(self.hidden_size, 1).cuda()
+        self.relu = nn.ReLU()
+
+        torch.nn.init.constant_(self.fc1.weight, 0.01)
+        torch.nn.init.constant_(self.fc2.weight, 0.01)
+
+    def forward(self, embeddings,positive):
+
+        # 按照倒数第一维进行拼接 [128, 8] cat(-1) [128, 8] -> [128, 16]
+        cat_embeddings = torch.cat((embeddings, positive),dim = -1)
+        #print(cat_embeddings.shape)
+        # pre:[128, 4]
+        pre = self.relu(self.fc1(cat_embeddings))
+        # pre:[128, 1]
+        pre = self.fc2(pre)
+
+        return pre

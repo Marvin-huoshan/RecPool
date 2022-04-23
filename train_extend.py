@@ -19,6 +19,8 @@ import random
 import shutil
 import time
 
+from tqdm import tqdm
+
 import cross_val
 import encoders_extend as encoders
 import gen.feat as featgen
@@ -40,7 +42,7 @@ def evaluate(dataset, model, args, name='Validation', max_num_examples=None):
         batch_num_nodes = data['num_nodes'].int().numpy()
         assign_input = Variable(data['assign_feats'].float(), requires_grad=False).cuda()
 
-        ypred, _ = model(h0, adj, batch_num_nodes, assign_x=assign_input)
+        ypred, _ , _= model(h0, adj, batch_num_nodes, assign_x=assign_input)
         #print(ypred)
         _, indices = torch.max(ypred, 1)
         preds.append(indices.cpu().data.numpy())
@@ -177,7 +179,7 @@ def log_graph(adj, batch_num_nodes, writer, epoch, batch_idx, assign_tensor=None
 def train(dataset, model, args, index, same_feat=True, val_dataset=None, test_dataset=None, writer=None,
         mask_nodes = True):
     writer_batch_idx = [0, 3, 6, 9]
-    
+    discriminator = encoders.Discriminator(args)
     optimizer = torch.optim.Adam(filter(lambda p : p.requires_grad, model.parameters()), lr=0.001)
     iter = 0
     best_val_result = {
@@ -217,17 +219,33 @@ def train(dataset, model, args, index, same_feat=True, val_dataset=None, test_da
             batch_num_nodes = data['num_nodes'].int().numpy() if mask_nodes else None
             assign_input = Variable(data['assign_feats'].float(), requires_grad=False).cuda()
             #assign_input = Variable(data['assign_feats'].float(), requires_grad=False)
-            ypred, extend_embedding_tensor = model(h0, adj, batch_num_nodes, assign_x=assign_input)
+            ypred, extend_embedding_tensor, embedding = model(h0, adj, batch_num_nodes, assign_x=assign_input)
+            for j in range(0, int(args.inner_loop)):
+                # 局部优化器
+                optimizer_local = torch.optim.Adam(discriminator.parameters(),
+                                                   lr=0.01,
+                                                   weight_decay=args.weight_decay)
+                # 局部梯度清零
+                optimizer_local.zero_grad()
+                # embedding:[128, 8], positive:[128, 8]
+                local_loss = - model.MI_Est(discriminator, embedding, extend_embedding_tensor)
+                local_loss.backward(retain_graph=True)
+                optimizer_local.step()
+                # 获得了一个优化后的辨别器
+            mi_loss = model.MI_Est(discriminator, embedding, extend_embedding_tensor)
+            optimizer.zero_grad()
+
             if not args.method == 'soft-assign' or not args.linkpred:
                 # ypred:[20, 6]; label:[20]
+                # loss1使用subgraph来预测label，作为cls_loss(y,G_sub)
                 loss1 = model.loss(ypred, label)
                 loss2 = model.extend_loss(extend_embedding_tensor, adj, batch_num_nodes)
-                #kl_divergence = 1 / model.mean.size(1) * (1 + model.logstd - torch.abs(model.mean)
-                #                                          - torch.exp(model.logstd)).sum(2).mean()
-                kl_divergence_gaussian = 0.5 / model.mean.size(1) * (1 + 2 * model.logstd - model.mean ** 2
-                                                                     - torch.exp(model.logstd) ** 2).sum(2).mean()
-                loss = loss1 + loss2 - kl_divergence_gaussian
-                #loss = loss1 + loss2 - kl_divergence
+                kl_divergence = 1 / model.mean.size(1) * (1 + model.logstd - torch.abs(model.mean)
+                                                          - torch.exp(model.logstd)).sum(2).mean()
+                #kl_divergence_gaussian = 0.5 / model.mean.size(1) * (1 + 2 * model.logstd - model.mean ** 2
+                #                                                     - torch.exp(model.logstd) ** 2).sum(2).mean()
+                #loss = loss1 + loss2 - kl_divergence_gaussian
+                loss = loss1 + loss2 + args.mi_weight * mi_loss - kl_divergence
             else:
                 loss = model.loss(ypred, label, adj, batch_num_nodes)
             # 反向传播
@@ -625,7 +643,9 @@ def arg_parse():
             help='Method. Possible values: base, base-set2set, soft-assign')
     parser.add_argument('--name-suffix', dest='name_suffix',
             help='suffix added to the output filename')
-
+    parser.add_argument('--inner_loop', dest='inner_loop',default=150)
+    parser.add_argument('--weight_decay',default=5*10**-5)
+    parser.add_argument('--mi_weight',default=0.2)
     parser.set_defaults(datadir='data',
                         logdir='log',
                         dataset='syn1v2',
@@ -635,7 +655,7 @@ def arg_parse():
                         lr=0.001,
                         clip=2.0,
                         batch_size=20,
-                        num_epochs=1000,
+                        num_epochs=600,
                         train_ratio=0.8,
                         test_ratio=0.1,
                         num_workers=0,
@@ -648,7 +668,10 @@ def arg_parse():
                         method='base',
                         name_suffix='',
                         assign_ratio=0.1,
-                        num_pool=1
+                        num_pool=1,
+                        inner_loop=20,
+                        weight_decay=5*10**-5,
+                        mi_weight=0.2
                        )
     return parser.parse_args()
 
