@@ -212,7 +212,6 @@ def train(dataset, model, args, index, same_feat=True, val_dataset=None, test_da
             #每个batch中包含多个子图，获得其label
             label = Variable(data['label'].long()).cuda()
             batch_num_nodes = data['num_nodes'].int().numpy() if mask_nodes else None
-            #assign_input与h0一样？
             assign_input = Variable(data['assign_feats'].float(), requires_grad=False).cuda()
             #forward
             ypred = model(h0, adj, batch_num_nodes, assign_x=assign_input)
